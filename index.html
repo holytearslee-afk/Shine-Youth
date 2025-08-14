@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Everyday Challenge</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Noto Sans KR', sans-serif; }
+        .password-dot { -webkit-text-security: disc; }
+        .popup-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.6);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        .popup-content {
+            background: white;
+            padding: 2rem;
+            border-radius: 1rem;
+            text-align: center;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+            animation: fadeIn 0.3s ease-out;
+            min-width: 300px;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: scale(0.9); }
+            to { opacity: 1; transform: scale(1); }
+        }
+        .confetti {
+            position: absolute;
+            width: 10px;
+            height: 10px;
+            background: #f00;
+            opacity: 0.7;
+            animation: fall 3s linear infinite;
+        }
+        @keyframes fall {
+            to {
+                transform: translateY(100vh) rotate(360deg);
+                opacity: 0;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 text-gray-800">
+
+    <!-- Firestore 초기화 및 인증 -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, getDocs, writeBatch, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase 설정 ---
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "YOUR_API_KEY", authDomain: "YOUR_AUTH_DOMAIN", projectId: "YOUR_PROJECT_ID" };
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'everyday-challenge-app';
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+
+        // --- 전역 변수 ---
+        let currentUserId = null;
+        let membersUnsubscribe = null;
+        let progressUnsubscribe = null;
+        let configUnsubscribe = null;
+        let configData = { targetScore: 20 }; // 기본값
+        const exercisePoints = { squat: 1, crunch: 1, lunge: 2, pushup: 1, burpee: 4 };
+
+        // --- 인증 처리 ---
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                currentUserId = user.uid;
+                console.log("인증 성공:", currentUserId);
+                // 비밀번호 화면을 먼저 띄움
+                document.getElementById('password-screen').classList.remove('hidden');
+            } else {
+                try {
+                    if (typeof __initial_auth_token !== 'undefined') {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    console.error("익명 로그인 실패:", error);
+                }
+            }
+        });
+
+        // --- 사용자 등록 확인 ---
+        async function checkUserRegistration() {
+            const memberId = localStorage.getItem('everydayChallengeMemberId');
+            if (memberId) {
+                // 등록된 사용자인지 DB에서 확인
+                const memberRef = doc(db, 'artifacts', appId, 'public', 'data', 'members', memberId);
+                const memberSnap = await getDoc(memberRef);
+                if (memberSnap.exists()) {
+                    document.getElementById('registration-screen').classList.add('hidden');
+                    document.getElementById('main-app').classList.remove('hidden');
+                    setupDataListeners();
+                } else {
+                    // DB에선 삭제되었으나 로컬스토리지엔 남아있는 경우
+                    localStorage.removeItem('everydayChallengeMemberId');
+                    document.getElementById('main-app').classList.add('hidden');
+                    document.getElementById('registration-screen').classList.remove('hidden');
+                }
+            } else {
+                // 신규 사용자
+                document.getElementById('main-app').classList.add('hidden');
+                document.getElementById('registration-screen').classList.remove('hidden');
+            }
+        }
+        
+        // --- 데이터 리스너 설정 ---
+        function setupDataListeners() {
+            if (!currentUserId) return;
+
+            const configRef = doc(db, 'artifacts', appId, 'public', 'data', 'config', 'settings');
+            if (configUnsubscribe) configUnsubscribe();
+            configUnsubscribe = onSnapshot(configRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    configData = docSnap.data();
+                    document.getElementById('target-score-input').value = configData.targetScore;
+                    document.getElementById('current-target-score').textContent = configData.targetScore;
+                } else {
+                    setDoc(configRef, { targetScore: 20 });
+                }
+            });
+
+            const membersRef = collection(db, 'artifacts', appId, 'public', 'data', 'members');
+            if (membersUnsubscribe) membersUnsubscribe();
+            membersUnsubscribe = onSnapshot(membersRef, (snapshot) => {
+                const members = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderMembers(members);
+                renderAdminMemberList(members);
+                subscribeToDailyProgress();
+            });
+        }
+
+        function subscribeToDailyProgress() {
+            if (progressUnsubscribe) progressUnsubscribe();
+
+            const today = new Date().toISOString().slice(0, 10);
+            const progressRef = collection(db, 'artifacts', appId, 'public', 'data', 'progress', today, 'entries');
+            progressUnsubscribe = onSnapshot(progressRef, (snapshot) => {
+                const progresses = {};
+                snapshot.docs.forEach(doc => {
+                    progresses[doc.id] = doc.data();
+                });
+                updateProgressUI(progresses);
+            });
+            renderWeeklyReport();
+        }
+
+        // --- UI 렌더링 ---
+        function renderMembers(members) {
+            const container = document.getElementById('members-container');
+            container.innerHTML = '';
+            if (members.length === 0) {
+                container.innerHTML = `<p class="text-gray-500 col-span-full text-center">등록된 멤버가 없습니다.</p>`;
+                return;
+            }
+            members.forEach(member => {
+                const memberEl = document.createElement('div');
+                memberEl.id = `member-${member.id}`;
+                memberEl.className = 'bg-white p-4 rounded-lg shadow-md';
+                memberEl.innerHTML = `
+                    <h3 class="font-bold text-lg mb-2">${member.name}</h3>
+                    <div class="space-y-2">
+                        ${createInput('스쿼트', 'squat', member.id)}
+                        ${createInput('크런치', 'crunch', member.id)}
+                        ${createInput('런지', 'lunge', member.id)}
+                        ${createInput('푸쉬업', 'pushup', member.id)}
+                        ${createInput('버피테스트', 'burpee', member.id)}
+                    </div>
+                    <div class="mt-4">
+                        <div class="w-full bg-gray-200 rounded-full h-2.5">
+                            <div id="progress-bar-${member.id}" class="bg-blue-600 h-2.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+                        </div>
+                        <p class="text-right text-sm mt-1">
+                            <span id="score-${member.id}">0</span> / ${configData.targetScore} 점
+                        </p>
+                    </div>
+                `;
+                container.appendChild(memberEl);
+            });
+
+            document.querySelectorAll('.exercise-input').forEach(input => {
+                input.addEventListener('input', (e) => handleExerciseInput(e.target));
+            });
+        }
+
+        function createInput(label, type, memberId) {
+            const points = exercisePoints[type];
+            return `
+                <div class="flex items-center justify-between">
+                    <label for="${type}-${memberId}" class="text-sm">${label} (${points}점/개)</label>
+                    <input type="number" id="${type}-${memberId}" data-member-id="${memberId}" data-exercise-type="${type}" class="exercise-input w-20 p-1 border rounded text-center" min="0" placeholder="0">
+                </div>
+            `;
+        }
+
+        function updateProgressUI(progresses) {
+            document.querySelectorAll('[id^="member-"]').forEach(memberEl => {
+                const memberId = memberEl.id.split('-')[1];
+                if (!memberId) return;
+
+                const progress = progresses[memberId] || {};
+                let totalScore = 0;
+                
+                Object.entries(exercisePoints).forEach(([type, points]) => {
+                    const count = progress[type] || 0;
+                    const inputEl = document.getElementById(`${type}-${memberId}`);
+                    if (inputEl) inputEl.value = count > 0 ? count : '';
+                    totalScore += count * points;
+                });
+                
+                const scoreEl = document.getElementById(`score-${memberId}`);
+                const barEl = document.getElementById(`progress-bar-${memberId}`);
+                if(scoreEl && barEl) {
+                    scoreEl.textContent = Math.round(totalScore * 10) / 10;
+                    const percentage = Math.min((totalScore / configData.targetScore) * 100, 100);
+                    barEl.style.width = `${percentage}%`;
+
+                    if (percentage >= 100 && !document.body.hasAttribute(`data-popup-shown-${memberId}`)) {
+                        showCompletionPopup(document.querySelector(`#member-${memberId} h3`).textContent);
+                        document.body.setAttribute(`data-popup-shown-${memberId}`, 'true');
+                    }
+                }
+            });
+        }
+        
+        async function renderWeeklyReport() {
+            const reportContainer = document.getElementById('weekly-report-container');
+            const { startOfWeek, endOfWeek } = getWeekDateRange();
+            reportContainer.innerHTML = `<h3 class="text-xl font-bold mb-4">주간 리포트 (${startOfWeek.toLocaleDateString()} ~ ${endOfWeek.toLocaleDateString()})</h3>`;
+
+            const membersSnapshot = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'members'));
+            const members = membersSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+            let totalTeamScore = 0;
+            const memberScores = [];
+
+            for (const member of members) {
+                let memberTotalScore = 0;
+                for (let d = new Date(startOfWeek); d <= endOfWeek; d.setDate(d.getDate() + 1)) {
+                    const dateStr = d.toISOString().slice(0, 10);
+                    const progressDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'progress', dateStr, 'entries', member.id);
+                    const progressDoc = await getDoc(progressDocRef);
+                    if (progressDoc.exists()) {
+                        const data = progressDoc.data();
+                        let dailyScore = 0;
+                        Object.entries(data).forEach(([type, count]) => {
+                           dailyScore += (count || 0) * (exercisePoints[type] || 0);
+                        });
+                        if(dailyScore >= configData.targetScore) {
+                           memberTotalScore += 1;
+                        }
+                    }
+                }
+                memberScores.push({ name: member.name, score: memberTotalScore });
+                totalTeamScore += memberTotalScore;
+            }
+            
+            const personalList = document.createElement('div');
+            personalList.className = 'mb-4';
+            personalList.innerHTML = '<h4 class="font-semibold mb-2">개인별 주간 달성일</h4>';
+            if(memberScores.length > 0) {
+                memberScores.sort((a, b) => b.score - a.score).forEach(item => {
+                    personalList.innerHTML += `<p>${item.name}: ${item.score}일 완료</p>`;
+                });
+            } else {
+                personalList.innerHTML += `<p class="text-gray-500">데이터가 없습니다.</p>`;
+            }
+            reportContainer.appendChild(personalList);
+
+            const totalEl = document.createElement('div');
+            totalEl.innerHTML = `<h4 class="font-semibold mb-2">팀 전체 주간 달성일</h4><p class="text-lg font-bold text-blue-600">${totalTeamScore}일</p>`;
+            reportContainer.appendChild(totalEl);
+
+            const todayDay = new Date().getDay();
+            document.getElementById('weekly-report').classList.toggle('hidden', todayDay !== 0);
+        }
+
+        function renderAdminMemberList(members) {
+            const listEl = document.getElementById('admin-member-list');
+            listEl.innerHTML = '';
+            members.forEach(member => {
+                const itemEl = document.createElement('li');
+                itemEl.className = 'flex justify-between items-center p-2 border-b';
+                itemEl.innerHTML = `
+                    <span>${member.name}</span>
+                    <button data-id="${member.id}" data-name="${member.name}" class="delete-member-btn bg-red-500 text-white px-2 py-1 rounded text-sm hover:bg-red-600">삭제</button>
+                `;
+                listEl.appendChild(itemEl);
+            });
+            document.querySelectorAll('.delete-member-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const message = `정말로 '${btn.dataset.name}' 멤버를 삭제하시겠습니까?`;
+                    showModal(message, () => deleteMember(btn.dataset.id));
+                });
+            });
+        }
+
+        // --- 이벤트 핸들러 ---
+        async function handleRegistration() {
+            const nameInput = document.getElementById('new-user-name');
+            const name = nameInput.value.trim();
+            if (name) {
+                const membersRef = collection(db, 'artifacts', appId, 'public', 'data', 'members');
+                const newMemberRef = doc(membersRef); // 자동 ID 생성
+                await setDoc(newMemberRef, { name: name });
+                localStorage.setItem('everydayChallengeMemberId', newMemberRef.id);
+                nameInput.value = '';
+                await checkUserRegistration();
+            } else {
+                showAlert("이름을 입력해주세요.");
+            }
+        }
+
+        async function handleExerciseInput(inputElement) {
+            const memberId = inputElement.dataset.memberId;
+            const exerciseType = inputElement.dataset.exerciseType;
+            const count = parseInt(inputElement.value, 10) || 0;
+            
+            const today = new Date().toISOString().slice(0, 10);
+            const progressDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'progress', today, 'entries', memberId);
+
+            try {
+                await setDoc(progressDocRef, { [exerciseType]: count }, { merge: true });
+            } catch (error) {
+                console.error("운동 기록 저장 실패:", error);
+            }
+        }
+
+        // --- 관리자 기능 ---
+        async function deleteMember(memberId) {
+            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'members', memberId));
+            showAlert("멤버가 삭제되었습니다.");
+        }
+
+        async function resetAllData() {
+            const message = "정말로 모든 멤버의 진행 상황과 주간 기록을 초기화하시겠습니까? 이 작업은 되돌릴 수 없습니다.";
+            showModal(message, async () => {
+                const batch = writeBatch(db);
+                const progressCollectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'progress');
+                const progressSnap = await getDocs(progressCollectionRef);
+                
+                // This is a simplified approach. For production, use batched reads or Cloud Functions for large datasets.
+                for (const dayDoc of progressSnap.docs) {
+                    const entriesCollectionRef = collection(db, dayDoc.ref.path, 'entries');
+                    const entriesSnap = await getDocs(entriesCollectionRef);
+                    entriesSnap.forEach(entryDoc => {
+                        batch.delete(entryDoc.ref);
+                    });
+                }
+                
+                await batch.commit();
+                showAlert("모든 데이터가 초기화되었습니다.");
+                renderWeeklyReport();
+            });
+        }
+
+        async function updateTargetScore() {
+            const newScore = parseInt(document.getElementById('target-score-input').value, 10);
+            if (!isNaN(newScore) && newScore > 0) {
+                const configRef = doc(db, 'artifacts', appId, 'public', 'data', 'config', 'settings');
+                await updateDoc(configRef, { targetScore: newScore });
+                showAlert("목표 점수가 업데이트되었습니다.");
+            } else {
+                showAlert("유효한 숫자를 입력하세요.");
+            }
+        }
+
+        // --- 유틸리티 함수 ---
+        function getWeekDateRange() {
+            const now = new Date();
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            const dayOfWeek = today.getDay();
+            const startOfWeek = new Date(today);
+            startOfWeek.setDate(today.getDate() - dayOfWeek);
+            const endOfWeek = new Date(startOfWeek);
+            endOfWeek.setDate(startOfWeek.getDate() + 6);
+            return { startOfWeek, endOfWeek };
+        }
+
+        function showCompletionPopup(memberName) {
+            const overlay = document.createElement('div');
+            overlay.className = 'popup-overlay';
+            overlay.innerHTML = `
+                <div class="popup-content">
+                    <h2 class="text-3xl font-bold text-yellow-400 mb-2">🎉 루틴 완료! 🎉</h2>
+                    <p class="text-lg font-semibold">${memberName}님, 오늘의 도전을 성공적으로 마쳤습니다!</p>
+                    <p class="text-xs mt-4 text-gray-500">(탭하여 닫기)</p>
+                </div>
+            `;
+            
+            for (let i = 0; i < 50; i++) {
+                const confetti = document.createElement('div');
+                confetti.className = 'confetti';
+                confetti.style.left = Math.random() * 100 + 'vw';
+                confetti.style.animationDelay = Math.random() * 2 + 's';
+                confetti.style.backgroundColor = `hsl(${Math.random() * 360}, 100%, 50%)`;
+                overlay.appendChild(confetti);
+            }
+
+            overlay.addEventListener('click', () => overlay.remove());
+            document.body.appendChild(overlay);
+        }
+
+        function showModal(message, onConfirm) {
+            const overlay = document.createElement('div');
+            overlay.className = 'popup-overlay';
+            overlay.id = 'custom-modal';
+            overlay.innerHTML = `
+                <div class="popup-content">
+                    <p class="text-lg mb-6">${message}</p>
+                    <div class="flex justify-center gap-4">
+                        <button id="modal-confirm-btn" class="bg-red-500 text-white px-6 py-2 rounded hover:bg-red-600">확인</button>
+                        <button id="modal-cancel-btn" class="bg-gray-300 px-6 py-2 rounded hover:bg-gray-400">취소</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+
+            document.getElementById('modal-confirm-btn').onclick = () => {
+                if (onConfirm) onConfirm();
+                overlay.remove();
+            };
+            document.getElementById('modal-cancel-btn').onclick = () => {
+                overlay.remove();
+            };
+        }
+
+        function showAlert(message) {
+            const overlay = document.createElement('div');
+            overlay.className = 'popup-overlay';
+            overlay.id = 'custom-alert';
+            overlay.innerHTML = `
+                <div class="popup-content">
+                    <p class="text-lg mb-6">${message}</p>
+                    <div class="flex justify-center">
+                        <button id="alert-ok-btn" class="bg-blue-500 text-white px-8 py-2 rounded hover:bg-blue-600">확인</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+            document.getElementById('alert-ok-btn').onclick = () => {
+                overlay.remove();
+            };
+        }
+
+        // --- 비밀번호 및 화면 전환 ---
+        function checkPassword(type) {
+            const inputId = type === 'app' ? 'app-password-input' : 'admin-password-input';
+            const correctPw = type === 'app' ? '0920' : '4655';
+            const input = document.getElementById(inputId);
+            
+            if (input.textContent === correctPw) {
+                if (type === 'app') {
+                    document.getElementById('password-screen').classList.add('hidden');
+                    checkUserRegistration(); // 비밀번호 확인 후 등록 여부 체크
+                } else {
+                    document.getElementById('admin-login-modal').classList.add('hidden');
+                    document.getElementById('admin-panel').classList.remove('hidden');
+                }
+            } else {
+                const feedbackEl = document.getElementById(`${type}-pw-feedback`);
+                feedbackEl.textContent = "비밀번호가 틀렸습니다.";
+                input.textContent = '';
+                setTimeout(() => { feedbackEl.textContent = ''; }, 2000);
+            }
+        }
+
+        function handleNumpad(num, type) {
+            const inputId = type === 'app' ? 'app-password-input' : 'admin-password-input';
+            const input = document.getElementById(inputId);
+            if (num === 'del') {
+                input.textContent = input.textContent.slice(0, -1);
+            } else if (input.textContent.length < 6) {
+                input.textContent += num;
+            }
+        }
+
+        window.handleRegistration = handleRegistration;
+        window.resetAllData = resetAllData;
+        window.updateTargetScore = updateTargetScore;
+        window.checkPassword = checkPassword;
+        window.handleNumpad = handleNumpad;
+        window.showAdminLogin = () => {
+            document.getElementById('admin-password-input').textContent = '';
+            document.getElementById('admin-login-modal').classList.remove('hidden');
+        };
+        window.closeAdminLogin = () => {
+            document.getElementById('admin-login-modal').classList.add('hidden');
+        };
+        window.closeAdminPanel = () => {
+            document.getElementById('admin-panel').classList.add('hidden');
+        };
+    </script>
+
+    <!-- 앱 접근 비밀번호 화면 -->
+    <div id="password-screen" class="hidden min-h-screen flex flex-col items-center justify-center bg-gray-800 text-white p-4">
+        <h1 class="text-4xl font-bold mb-2">Everyday Challenge</h1>
+        <p class="mb-8">앱에 접속하려면 비밀번호를 입력하세요.</p>
+        <div id="app-password-input" class="password-dot text-4xl h-12 w-48 bg-gray-700 rounded-lg flex items-center justify-center tracking-[.5em] px-2"></div>
+        <p id="app-pw-feedback" class="text-red-400 h-6 mt-2"></p>
+        <div class="grid grid-cols-3 gap-4 mt-4">
+            <button onclick="handleNumpad('1', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">1</button>
+            <button onclick="handleNumpad('2', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">2</button>
+            <button onclick="handleNumpad('3', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">3</button>
+            <button onclick="handleNumpad('4', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">4</button>
+            <button onclick="handleNumpad('5', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">5</button>
+            <button onclick="handleNumpad('6', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">6</button>
+            <button onclick="handleNumpad('7', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">7</button>
+            <button onclick="handleNumpad('8', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">8</button>
+            <button onclick="handleNumpad('9', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">9</button>
+            <button onclick="handleNumpad('del', 'app')" class="w-20 h-20 bg-gray-600 rounded-full text-xl active:bg-gray-500">삭제</button>
+            <button onclick="handleNumpad('0', 'app')" class="w-20 h-20 bg-gray-700 rounded-full text-2xl font-bold active:bg-gray-600">0</button>
+            <button onclick="checkPassword('app')" class="w-20 h-20 bg-blue-600 rounded-full text-xl active:bg-blue-500">확인</button>
+        </div>
+    </div>
+
+    <!-- 사용자 등록 화면 -->
+    <div id="registration-screen" class="hidden min-h-screen flex flex-col items-center justify-center bg-gray-100 p-4">
+        <div class="w-full max-w-sm text-center">
+            <h1 class="text-3xl font-bold mb-2">챌린지에 오신 것을 환영합니다!</h1>
+            <p class="text-gray-600 mb-8">사용하실 이름을 입력하고 등록해주세요.</p>
+            <input type="text" id="new-user-name" placeholder="이름 입력" class="w-full p-3 border rounded-lg mb-4 text-center text-lg">
+            <button onclick="handleRegistration()" class="w-full bg-blue-600 text-white py-3 rounded-lg text-lg font-semibold hover:bg-blue-700">등록하고 시작하기</button>
+        </div>
+    </div>
+
+    <!-- 메인 앱 화면 -->
+    <div id="main-app" class="hidden max-w-4xl mx-auto p-4 md:p-6">
+        <header class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-3xl font-bold text-gray-900">Everyday Challenge</h1>
+                <p class="text-gray-600">오늘의 목표 점수: <span id="current-target-score" class="font-bold">20</span>점</p>
+            </div>
+            <button onclick="showAdminLogin()" class="bg-gray-700 text-white px-4 py-2 rounded-lg hover:bg-gray-800">관리자</button>
+        </header>
+
+        <main>
+            <div id="members-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+            <div id="weekly-report" class="mt-8 bg-white p-6 rounded-lg shadow-md hidden">
+                <div id="weekly-report-container"></div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 관리자 로그인 모달 -->
+    <div id="admin-login-modal" class="popup-overlay hidden">
+        <div class="popup-content w-full max-w-sm">
+            <h2 class="text-2xl font-bold mb-4">관리자 로그인</h2>
+            <div id="admin-password-input" class="password-dot text-3xl h-10 bg-gray-200 rounded-lg flex items-center justify-center tracking-[.5em] px-2"></div>
+            <p id="admin-pw-feedback" class="text-red-500 h-6 mt-2"></p>
+            <div class="grid grid-cols-3 gap-2 mt-4">
+                <button onclick="handleNumpad('1', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">1</button>
+                <button onclick="handleNumpad('2', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">2</button>
+                <button onclick="handleNumpad('3', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">3</button>
+                <button onclick="handleNumpad('4', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">4</button>
+                <button onclick="handleNumpad('5', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">5</button>
+                <button onclick="handleNumpad('6', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">6</button>
+                <button onclick="handleNumpad('7', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">7</button>
+                <button onclick="handleNumpad('8', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">8</button>
+                <button onclick="handleNumpad('9', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">9</button>
+                <button onclick="handleNumpad('del', 'admin')" class="p-4 bg-gray-100 rounded active:bg-gray-200">삭제</button>
+                <button onclick="handleNumpad('0', 'admin')" class="p-4 bg-gray-200 rounded text-xl active:bg-gray-300">0</button>
+                <button onclick="checkPassword('admin')" class="p-4 bg-blue-500 text-white rounded active:bg-blue-600">확인</button>
+            </div>
+            <button onclick="closeAdminLogin()" class="mt-4 text-sm text-gray-600">닫기</button>
+        </div>
+    </div>
+
+    <!-- 관리자 패널 -->
+    <div id="admin-panel" class="popup-overlay hidden">
+        <div class="popup-content w-full max-w-md">
+            <h2 class="text-2xl font-bold mb-6">관리자 패널</h2>
+            <div class="mb-6 text-left">
+                <h3 class="font-semibold mb-2">멤버 목록</h3>
+                <ul id="admin-member-list" class="border rounded p-2 h-40 overflow-y-auto"></ul>
+            </div>
+            <div class="mb-6 text-left">
+                <h3 class="font-semibold mb-2">설정</h3>
+                <div class="flex items-center gap-2">
+                    <label for="target-score-input">목표 점수:</label>
+                    <input type="number" id="target-score-input" class="w-20 p-2 border rounded">
+                    <button onclick="updateTargetScore()" class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600">저장</button>
+                </div>
+            </div>
+            <div class="text-left">
+                <h3 class="font-semibold mb-2">데이터 관리</h3>
+                <button onclick="resetAllData()" class="w-full bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600">모든 데이터 초기화</button>
+                <p class="text-xs text-gray-500 mt-1">주의: 모든 멤버의 운동 기록이 영구적으로 삭제됩니다.</p>
+            </div>
+            <button onclick="closeAdminPanel()" class="mt-8 bg-gray-200 px-4 py-2 rounded">닫기</button>
+        </div>
+    </div>
+
+</body>
+</html>
